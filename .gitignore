@@ -1,0 +1,25 @@
+# R
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+# knitted output and generated results
+*.html
+*_cache/
+*_files/
+*.rda
+*.csv
+ideation.xlsx
+attempt.xlsx
+figures_main/
+# OS
+.DS_Store
+Thumbs.db
+# renv: keep renv.lock, .Rprofile, renv/activate.R and renv/settings.json; ignore the library
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/

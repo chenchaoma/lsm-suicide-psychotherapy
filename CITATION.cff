@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite the article and this software archive."
+title: "Analysis code: Location-scale moderator analysis of psychological interventions for suicidality"
+type: software
+version: "1.0.0"
+date-released: "2026-11-09"
+license: MIT
+authors:
+  - family-names: Ma
+    given-names: Chenchao
+    affiliation: "Amsterdam UMC; Vrije Universiteit Amsterdam"
+    # orcid: "https://orcid.org/0000-0000-0000-0000"
+keywords:
+  - meta-analysis
+  - location-scale models
+  - suicide prevention
+  - psychological interventions
+  - heterogeneity
+  - R
+preferred-citation:
+  type: article
+  title: "Heterogeneity of Treatment Effects in Psychological Interventions for Suicidality: A Meta-Epidemiological Study of Location and Scale Moderators"
+  authors:
+    - family-names: Ma
+      given-names: Chenchao
+    - family-names: von Spreckelsen
+      given-names: Paula
+    - family-names: Harrer
+      given-names: Mathias
+    - family-names: Kuper
+      given-names: Paula
+    - family-names: van Straten
+      given-names: Annemieke
+    - family-names: van Ballegooijen
+      given-names: Wouter
+  journal: "Journal of Affective Disorders"
+  year: 2026

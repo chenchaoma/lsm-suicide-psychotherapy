@@ -1,0 +1,1818 @@
+---
+title: "Heterogeneity of Treatment Effects in Psychological Interventions for Suicidality: Location-Scale Moderator Analysis"
+author: "Chenchao Ma"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      cache = TRUE, autodep = TRUE)
+# Chunks are cached: a re-knit only reruns chunks whose code (or upstream
+# objects) changed. Delete the *_cache/ folder to force a complete rerun.
+```
+
+# Overview
+
+Analysis code for Ma et al., *Heterogeneity of Treatment Effects in Psychological
+Interventions for Suicidality: A Meta-Epidemiological Study of Location and Scale
+Moderators* (submitted to *Journal of Affective Disorders*). Preregistration: OSF
+[osf.io/xxx].
+
+**Input.** `master.xlsx`: the Metapsy *Suicide Prevention: Psychological
+Interventions vs. Control* database (van Ballegooijen & Harrer, 2025,
+<https://doi.org/10.5281/zenodo.8364508>), placed in the same folder as this file.
+
+**Run.** Knit this file (or run all chunks in order). Intermediate datasets,
+`.rda` result objects, CSV tables and the main-text figures (`figures_main/`) are
+written to the working directory.
+
+**Structure.**
+
+| Section | Content | Manuscript |
+|---|---|---|
+| 1 | Data preparation, RoB scoring, moderator coding | Methods, Table 1 |
+| 2 | Analytic datasets and effect sizes | Methods |
+| 3 | Publication bias (Egger's test, limit estimate, income-level check) | Results, Fig. S4, S14 |
+| 4 | Overall heterogeneity and univariate location-scale models | Tables S1, S5 |
+| 5 | Multi-model selection and model averaging | Tables S8–S21 |
+| 6 | Sensitivity analyses (RoB, influential cases, outliers) | Tables S2–S4, S6–S7, S9–S14 |
+| 7 | Supplementary figures and tables | Supplement |
+| 8 | Main-text Figures 2 and 3 | Figures 2–3 |
+
+**Key analytic decisions.**
+
+1. **Risk of bias.** RoB 2 domains D1–D5 (D4 is rated per outcome). The RoB score
+   is the number of domains rated low risk (0–5; higher = lower risk). It is
+   included as a covariate in every univariate model and competes as a regular
+   candidate in multi-model selection.
+2. **Scale component.** Modelled for suicidal ideation only. For suicide attempts
+   the unconditional heterogeneity was too low and imprecise to support a scale
+   model, so scale is intercept-only (deviation from the preregistration). These
+   models are fitted as standard random-effects meta-regressions, which are the
+   same models but avoid starting-value failures of the location-scale fitting
+   routine (e.g., a factor level with a single comparison, or tau^2 = 0).
+3. **Univariate models.** Each moderator plus RoB score, fitted on that
+   moderator's own complete cases (REML, Knapp-Hartung). Factor levels with
+   fewer than 4 comparisons are not estimated. Likelihood ratio tests (ML) compare
+   against a RoB-only model; moderators significant in a Wald test or the LRT are
+   checked with permutation tests (1,000 permutations).
+4. **Multi-model selection.** 11 candidates (all moderators including RoB score;
+   family involvement is examined in univariate models only because it overlaps
+   with delivery format and age group). Up to 4 moderators per model, entered in
+   both location and scale. All models are fitted on one fixed complete-case
+   sample per outcome so AICc values are comparable. Moderator pairs with
+   association ≥ .60 (Cramér's V, |r|, or correlation ratio) never enter the
+   same model. Results use full model averaging with Akaike weights.
+5. **Sensitivity analyses.** (A) univariate models without RoB adjustment;
+   (B) multi-model selection with RoB forced into every model; (C) influential
+   comparisons removed (`metafor::influence()` default rule on the
+   moderator-free model); (D) outliers removed (|studentized residual| > 3).
+   C and D refit both the univariate and multi-model stages.
+6. **Publication bias.** Egger's regression test. The bias-adjusted estimate is
+   the intercept of the Egger regression extrapolated to SE = 0. For ideation, the
+   tests are repeated by country income level.
+
+# 0. Reproducible environment (renv)
+
+Package versions are recorded in `renv.lock`. To reproduce the environment,
+open the project folder in R and run the chunk below once, before knitting
+(it is not evaluated during knitting).
+
+```{r renv-restore, eval = FALSE}
+install.packages("renv")
+renv::restore()   # installs the exact package versions listed in renv.lock
+```
+
+To record the environment after changing packages (authors only):
+
+```{r renv-snapshot, eval = FALSE}
+renv::snapshot()
+```
+
+```{r renv-status, cache = FALSE}
+# Report whether the installed packages match renv.lock
+if (file.exists("renv.lock") && requireNamespace("renv", quietly = TRUE)) {
+  renv::status()
+} else {
+  message("renv.lock or the renv package not found; package versions are listed under Session information.")
+}
+```
+
+# 1. Data preparation
+
+```{r packages, cache = FALSE}
+library(metafor)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(tibble)
+library(readxl)
+library(writexl)
+library(ggplot2)
+library(gridExtra)
+library(patchwork)
+library(viridis)
+library(RColorBrewer)
+
+DATA_FILE <- "master.xlsx"
+```
+
+```{r data-preparation, cache.extra = tools::md5sum(DATA_FILE)}
+master_raw <- read_excel(DATA_FILE, na = c("", " ", "-", "NA", "NR", "na", "nr"))
+master <- distinct(master_raw)
+cat("Duplicate rows removed:", nrow(master_raw) - nrow(master), "\n")
+
+
+# ── Risk of bias ─────────────────────────────────────────────────────────────
+# D1-D3 and D5 are shared across outcomes; D4 (outcome measurement) is rated
+# per outcome (rob_4 = ideation, rob_4_at = attempts). Self-reported outcomes
+# are rated low risk (Cuijpers et al., 2010; Kuper et al., 2025).
+
+rob_domains_common <- c("rob_1", "rob_2", "rob_3", "rob_5")
+
+clean_rob <- function(x) {
+  x <- as.character(x)
+  x <- gsub(intToUtf8(160), " ", x, fixed = TRUE)   # non-breaking spaces
+  x <- tolower(trimws(x))
+  x[x %in% c("", "-", "na", "nr")] <- NA_character_
+  case_when(
+    x == "high"                                    ~ "high",
+    x %in% c("some concerns", "some")              ~ "some concerns",
+    x %in% c("low", "low (self report)",
+             "self report", "self-report")         ~ "low",
+    TRUE                                           ~ NA_character_
+  )
+}
+
+# rob_total: overall rating (worst domain), used for the RoB summary figure
+# rob_dich:  high vs. low/some concerns (retained for reference)
+# rob_score: number of domains rated low (0-5), the covariate used in all models
+score_rob <- function(df, domain4) {
+  doms <- c(rob_domains_common, domain4)
+  df %>%
+    transmute(
+      .n_na = rowSums(is.na(across(all_of(doms)))),
+      rob_total = case_when(
+        if_any(all_of(doms), ~ !is.na(.) & . == "high")          ~ "high",
+        if_any(all_of(doms), ~ !is.na(.) & . == "some concerns") ~ "some concerns",
+        .n_na == 0                                               ~ "low",
+        TRUE                                                     ~ NA_character_
+      ),
+      rob_dich = case_when(
+        rob_total == "high"                      ~ "high",
+        rob_total %in% c("some concerns", "low") ~ "low_some",
+        TRUE                                     ~ NA_character_
+      ),
+      rob_score = rowSums(across(all_of(doms), ~ . == "low"), na.rm = TRUE)
+    ) %>%
+    select(-.n_na)
+}
+
+master <- master %>%
+  mutate(across(all_of(c(rob_domains_common, "rob_4", "rob_4_at")), clean_rob),
+         # use the ideation D4 rating where no attempt-specific rating exists
+         rob_4_at_use = coalesce(rob_4_at, rob_4))
+
+# Bound by row position (id is not unique). "rob_total_at2" avoids a clash with
+# an existing rob_total_at column in master.xlsx.
+master <- master %>%
+  bind_cols(
+    score_rob(master, "rob_4") %>%
+      rename(rob_total_si = rob_total, rob_dich_si = rob_dich, rob_score_si = rob_score),
+    score_rob(master, "rob_4_at_use") %>%
+      rename(rob_total_at2 = rob_total, rob_dich_at = rob_dich, rob_score_at = rob_score)
+  )
+
+
+# ── Moderators ───────────────────────────────────────────────────────────────
+
+master <- master %>%
+  mutate(
+    # Sample size for ideation (attempts use totaln_arm1/2; see Section 2)
+    n_arm1       = as.numeric(n_arm1),
+    n_arm2       = as.numeric(n_arm2),
+    total_sample = n_arm1 + n_arm2,
+
+    # Delivery format: one modality alone vs. individual + group vs.
+    # individual + family. Other combinations are set to missing.
+    combi = factor(
+      case_when(
+        format %in% c("ind", "grp", "group", "fam") ~ "single",
+        format == "ind and grp"                     ~ "ind_group",
+        format == "ind and fam"                     ~ "ind_family",
+        TRUE                                        ~ NA_character_
+      ),
+      levels = c("single", "ind_group", "ind_family")
+    ),
+    family_involvement = if_else(format %in% c("fam", "ind and fam"), "yes", "no"),
+
+    # Control condition: five original levels, not collapsed
+    control = if_else(
+      condition_arm2_new %in% c("wl", "cau", "ecau", "other ctr", "supp"),
+      condition_arm2_new, NA_character_
+    ),
+
+    age_dich = case_when(
+      age_group %in% c("adult", "old", "olderold") ~ "adult",
+      age_group %in% c("adol", "child", "yadul")   ~ "young",
+      TRUE                                         ~ NA_character_
+    )
+  )
+
+# Non-active control conditions only
+master <- master %>%
+  filter(condition_arm2_new %in% c("wl", "cau", "ecau", "other ctr", "supp"))
+
+# One identifier per comparison (study x arms x format)
+create_base_id <- function(df) {
+  df %>%
+    mutate(across(c(study, condition_arm1_new, condition_arm2_new,
+                    multi_arm1, multi_arm2, format),
+                  ~ ifelse(is.na(.), "NA", .))) %>%
+    mutate(base_id = paste(study, condition_arm1_new, condition_arm2_new,
+                           multi_arm1, multi_arm2, format, sep = "_"))
+}
+
+common_vars <- c(
+  "id", "study", "condition_arm1_new", "format",
+  "control", "combi", "family_involvement", "direct",
+  "duration_arm1_n", "total_sample", "rob_dich", "rob_score", "time_weeks", "lmic",
+  "disorder_suic", "age_dich", "percent_women", "outcome_type"
+)
+
+# Coding checks
+cat("\n--- RoB score distribution (ideation / attempts) ---\n")
+print(round(prop.table(table(master$rob_score_si)), 3))
+print(round(prop.table(table(master$rob_score_at)), 3))
+cat("\n--- Delivery format ---\n")
+print(count(master, format, combi, family_involvement))
+cat("\n--- Control condition ---\n")
+print(count(master, condition_arm2_new, control))
+```
+
+# 2. Analytic datasets and effect sizes
+
+```{r dataset-construction}
+# ── Suicidal ideation ────────────────────────────────────────────────────────
+
+numeric_cols_si <- c(
+  "n_sessions_arm1", "time_weeks",
+  "mean_arm1", "mean_arm2", "sd_arm1", "sd_arm2", "n_arm1", "n_arm2",
+  "si_event_arm1", "si_event_arm2", "si_n_arm1", "si_n_arm2",
+  "mean_change_arm1", "mean_change_arm2", "sd_change_arm1", "sd_change_arm2",
+  "n_change_arm1", "n_change_arm2", "precalc_g", "precalc_g_se"
+)
+
+ideation_cols <- c(
+  "mean_arm1", "sd_arm1", "mean_arm2", "sd_arm2",
+  "si_event_arm1", "si_n_arm1", "si_event_arm2", "si_n_arm2",
+  "mean_change_arm1", "sd_change_arm1", "mean_change_arm2", "sd_change_arm2",
+  "n_change_arm1", "n_change_arm2", "precalc_g", "precalc_g_se"
+)
+
+ideation_raw <- master %>%
+  mutate(across(all_of(numeric_cols_si), as.numeric)) %>%
+  filter(time == "post") %>%
+  filter(if_any(all_of(ideation_cols), ~ !is.na(.))) %>%
+  select(-starts_with(c("event_arm1", "event_arm2", "totaln_arm1", "totaln_arm2"))) %>%
+  rename(
+    event_arm1  = si_event_arm1,
+    event_arm2  = si_event_arm2,
+    totaln_arm1 = si_n_arm1,
+    totaln_arm2 = si_n_arm2
+  ) %>%
+  mutate(rob_dich = rob_dich_si, rob_score = rob_score_si) %>%
+  create_base_id()
+
+inst_freq <- ideation_raw %>%
+  filter(!is.na(instrument) & instrument != "NA") %>%
+  count(instrument, sort = TRUE) %>%
+  rename(inst_freq = n)
+
+# One data format per comparison, in order of preference:
+# post-test M/SD > change scores > precalculated g > deterioration (dichotomous)
+ideation_raw <- ideation_raw %>%
+  mutate(
+    outcome_type = case_when(
+      !is.na(mean_arm1) & !is.na(sd_arm1) & !is.na(n_arm1) &
+      !is.na(mean_arm2) & !is.na(sd_arm2) & !is.na(n_arm2)       ~ "msd",
+      !is.na(mean_change_arm1) & !is.na(sd_change_arm1) &
+      !is.na(mean_change_arm2) & !is.na(sd_change_arm2)          ~ "change",
+      !is.na(precalc_g) & !is.na(precalc_g_se)                   ~ "precalc",
+      !is.na(event_arm1) & !is.na(totaln_arm1) & totaln_arm1 > 0 ~ "deterioration",
+      TRUE                                                       ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(outcome_type)) %>%
+  mutate(   # deterioration counts -> non-deterioration counts
+    event_arm1 = if_else(outcome_type == "deterioration", totaln_arm1 - event_arm1, event_arm1),
+    event_arm2 = if_else(outcome_type == "deterioration", totaln_arm2 - event_arm2, event_arm2)
+  )
+
+# If a comparison reports several instruments, keep the preferred data format,
+# then the most frequently used instrument
+ideation_post <- ideation_raw %>%
+  arrange(study) %>%
+  left_join(inst_freq, by = "instrument") %>%
+  mutate(
+    inst_freq     = ifelse(is.na(inst_freq), 0, inst_freq),
+    type_priority = match(outcome_type, c("msd", "change", "precalc", "deterioration"))
+  ) %>%
+  group_by(base_id) %>%
+  arrange(type_priority, desc(inst_freq), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  select(-inst_freq, -type_priority) %>%
+  mutate(
+    percent_women   = as.numeric(as.character(percent_women)),
+    duration_arm1_n = as.numeric(duration_arm1)
+  )
+
+
+# ── Suicide attempts ─────────────────────────────────────────────────────────
+
+numeric_cols_at <- c(
+  "n_sessions_arm1", "time_weeks",
+  "mean_arm1", "mean_arm2", "sd_arm1", "sd_arm2", "n_arm1", "n_arm2",
+  "event_arm1", "event_arm2", "totaln_arm1", "totaln_arm2"
+)
+
+attempts_post <- master %>%
+  mutate(across(all_of(numeric_cols_at), as.numeric)) %>%
+  filter(str_detect(time, "post")) %>%
+  mutate(
+    outcome_type    = "RR",
+    rob_dich        = rob_dich_at,
+    rob_score       = rob_score_at,
+    percent_women   = as.numeric(as.character(percent_women)),
+    duration_arm1_n = as.numeric(duration_arm1),
+    # Sample size from the attempt denominators (totaln_arm1/2); n_arm1/2 refer
+    # to the ideation outcome. Falls back to n_arm per arm if missing.
+    total_sample    = coalesce(totaln_arm1, n_arm1) + coalesce(totaln_arm2, n_arm2)
+  ) %>%
+  create_base_id() %>%
+  group_by(base_id) %>%
+  arrange(is.na(event_arm1), .by_group = TRUE) %>%
+  slice(1) %>%
+  ungroup() %>%
+  filter(event_arm1 > 0 | event_arm2 > 0)   # drop double-zero trials
+
+
+# ── Variable selection and export ────────────────────────────────────────────
+
+ideation_specific <- c(
+  "mean_arm1", "sd_arm1", "mean_arm2", "sd_arm2",
+  "event_arm1", "event_arm2", "si_n_arm1", "si_n_arm2",
+  "totaln_arm1", "totaln_arm2",
+  "mean_change_arm1", "sd_change_arm1", "mean_change_arm2", "sd_change_arm2",
+  "n_change_arm1", "n_change_arm2",
+  "precalc_g", "precalc_g_se", "n_arm1", "n_arm2", "outcome_type"
+)
+
+attempt_specific <- c(
+  "event_arm1", "event_arm2", "attempts",
+  "suicides_arm1", "suicides_arm2",
+  "n_arm1", "n_arm2", "totaln_arm1", "totaln_arm2"
+)
+
+ideation_final <- ideation_post %>%
+  select(all_of(c(intersect(common_vars, names(.)), intersect(ideation_specific, names(.)))))
+
+attempt_final <- attempts_post %>%
+  select(all_of(c(intersect(common_vars, names(.)), intersect(attempt_specific, names(.)))))
+
+save(ideation_final, file = "ideation_data.rda")
+save(attempt_final,  file = "attempt_data.rda")
+write_xlsx(ideation_final, "ideation.xlsx")
+write_xlsx(attempt_final,  "attempt.xlsx")
+
+cat("Ideation comparisons:", nrow(ideation_final), "\n")
+cat("Attempt comparisons: ", nrow(attempt_final),  "\n")
+
+
+# ── Rescaled / centred moderators ────────────────────────────────────────────
+
+rescale_mods <- function(df) {
+  df %>% mutate(
+    total_n10    = total_sample / 10,
+    time_weeks_c = time_weeks    - mean(time_weeks,    na.rm = TRUE),
+    pct_women_c  = percent_women - mean(percent_women, na.rm = TRUE)
+  )
+}
+ideation_final <- rescale_mods(ideation_final)
+attempt_final  <- rescale_mods(attempt_final)
+
+
+# ── Effect sizes ─────────────────────────────────────────────────────────────
+# Ideation: Hedges' g (negative = favours intervention). Dichotomous outcomes
+# are converted from log OR to g (Chinn, 2000). Attempts: log risk ratio.
+
+ideation_msd <- ideation_final %>%
+  filter(outcome_type == "msd") %>%
+  escalc(measure = "SMD",
+         m1i = mean_arm1, sd1i = sd_arm1, n1i = n_arm1,
+         m2i = mean_arm2, sd2i = sd_arm2, n2i = n_arm2, data = .)
+
+ideation_change <- ideation_final %>%
+  filter(outcome_type == "change") %>%
+  escalc(measure = "SMD",
+         m1i = mean_change_arm1, sd1i = sd_change_arm1, n1i = n_change_arm1,
+         m2i = mean_change_arm2, sd2i = sd_change_arm2, n2i = n_change_arm2,
+         data = .)
+
+ideation_precalc <- ideation_final %>%
+  filter(outcome_type == "precalc") %>%
+  mutate(yi = precalc_g, vi = precalc_g_se^2)
+
+ideation_dich <- ideation_final %>%
+  filter(outcome_type == "deterioration") %>%
+  escalc(measure = "OR",
+         ai = event_arm1, n1i = totaln_arm1,
+         ci = event_arm2, n2i = totaln_arm2, data = .) %>%
+  mutate(yi = -yi * sqrt(3) / pi,
+         vi = vi * 3 / pi^2)
+
+ideation_final <- bind_rows(ideation_msd, ideation_change, ideation_precalc, ideation_dich) %>%
+  mutate(sei = sqrt(vi)) %>%
+  filter(!is.na(yi) & !is.na(sei))
+
+stopifnot(nrow(ideation_final) ==
+          sum(!is.na(ideation_msd$yi), !is.na(ideation_change$yi),
+              !is.na(ideation_precalc$yi), !is.na(ideation_dich$yi)))
+
+attempt_final <- attempt_final %>%
+  mutate(
+    totaln_arm1 = coalesce(as.numeric(totaln_arm1), as.numeric(n_arm1)),
+    totaln_arm2 = coalesce(as.numeric(totaln_arm2), as.numeric(n_arm2))
+  ) %>%
+  escalc(measure = "RR",
+         ai = event_arm1, n1i = totaln_arm1,
+         ci = event_arm2, n2i = totaln_arm2, data = .) %>%
+  mutate(sei = sqrt(vi)) %>%
+  filter(!is.na(yi) & !is.na(sei))
+
+ideation_final$rob_dich <- factor(ideation_final$rob_dich, levels = c("low_some", "high"))
+attempt_final$rob_dich  <- factor(attempt_final$rob_dich,  levels = c("low_some", "high"))
+
+cat("Ideation comparisons with effect size:", nrow(ideation_final), "\n")
+cat("Attempt comparisons with effect size: ", nrow(attempt_final),  "\n")
+```
+
+# 3. Publication bias
+
+```{r publication-bias}
+# Egger's regression test (classical weighted regression on the SE). The
+# bias-adjusted estimate is the Egger regression intercept, i.e. the predicted
+# effect at SE = 0.
+
+run_limit_manual <- function(data, label) {
+  m   <- rma(yi, vi, data = data, method = "REML", control = list(optimizer = "nlminb"))
+  fit <- regtest(m, model = "lm", predictor = "sei")$fit
+  est <- coef(fit)[1]
+  se  <- summary(fit)$coefficients[1, "Std. Error"]
+  ci  <- est + c(-1, 1) * 1.96 * se
+  cat(sprintf("%-12s k = %3d  pooled = %.3f  adjusted = %.3f [%.3f, %.3f]\n",
+              label, nrow(data), m$beta, est, ci[1], ci[2]))
+  invisible(list(pooled = as.numeric(m$beta), estimate = est, se = se, ci = ci))
+}
+
+egger_si <- rma(yi, sei = sei, data = ideation_final, method = "REML",
+                control = list(optimizer = "nlminb"))
+egger_at <- rma(yi, sei = sei, data = attempt_final, method = "REML",
+                control = list(optimizer = "nlminb"))
+rt_si <- regtest(egger_si, model = "lm", predictor = "sei")
+rt_at <- regtest(egger_at, model = "lm", predictor = "sei")
+
+cat("--- Egger's test: ideation ---\n");  print(rt_si)
+cat("--- Egger's test: attempts ---\n");  print(rt_at)
+
+lim_si <- run_limit_manual(ideation_final, "Ideation")
+lim_at <- run_limit_manual(attempt_final,  "Attempts")
+
+pub_bias_summary <- tibble(
+  outcome   = c("Suicidal ideation", "Suicide attempts"),
+  k         = c(nrow(ideation_final), nrow(attempt_final)),
+  pooled    = c(lim_si$pooled, lim_at$pooled),
+  egger_z   = c(rt_si$zval, rt_at$zval),
+  egger_p   = c(rt_si$pval, rt_at$pval),
+  limit_est = c(lim_si$estimate, lim_at$estimate),
+  limit_lb  = c(lim_si$ci[1], lim_at$ci[1]),
+  limit_ub  = c(lim_si$ci[2], lim_at$ci[2])
+)
+write.csv(pub_bias_summary, "publication_bias_summary.csv", row.names = FALSE)
+```
+
+```{r publication-bias-income}
+# Does the ideation small-study effect reflect the income-level difference?
+# (1) Egger's test and adjusted estimate within HIC and LMIC comparisons,
+# (2) whether the SE slope changes when income level is added, and whether it
+#     differs by income level (interaction).
+
+for (g in c("hic", "lmic")) {
+  d <- filter(ideation_final, lmic == g)
+  m <- rma(yi, sei = sei, data = d, method = "REML", control = list(optimizer = "nlminb"))
+  cat("---", toupper(g), " k =", nrow(d), "---\n")
+  print(regtest(m, model = "lm", predictor = "sei"))
+}
+
+lim_hic  <- run_limit_manual(filter(ideation_final, lmic == "hic"),  "HIC only")
+lim_lmic <- run_limit_manual(filter(ideation_final, lmic == "lmic"), "LMIC only")
+
+attenuation <- function(l) 100 * (1 - l$estimate / l$pooled)
+cat(sprintf("\nAttenuation: full = %.1f%%  HIC = %.1f%%  LMIC = %.1f%%\n",
+            attenuation(lim_si), attenuation(lim_hic), attenuation(lim_lmic)))
+
+ctrl <- list(optimizer = "nlminb")
+m_sei_only <- rma(yi, vi, mods = ~ sei,        data = ideation_final, method = "REML", control = ctrl)
+m_sei_lmic <- rma(yi, vi, mods = ~ sei + lmic, data = ideation_final, method = "REML", control = ctrl)
+m_interact <- rma(yi, vi, mods = ~ sei * lmic, data = ideation_final, method = "REML", control = ctrl)
+
+print(m_sei_only); print(m_sei_lmic); print(m_interact)
+cat(sprintf("\nSE coefficient: %.3f alone vs. %.3f adjusted for income level (%.0f%% reduction)\n",
+            m_sei_only$beta[2], m_sei_lmic$beta[2],
+            100 * (1 - m_sei_lmic$beta[2] / m_sei_only$beta[2])))
+
+ideation_final %>% group_by(lmic) %>%
+  summarise(k = n(),
+            median_n   = median(total_sample, na.rm = TRUE),
+            median_sei = round(median(sei), 3),
+            mean_yi    = round(mean(yi), 3)) %>%
+  print()
+
+save(egger_si, egger_at, lim_si, lim_at, lim_hic, lim_lmic, pub_bias_summary,
+     m_sei_only, m_sei_lmic, m_interact,
+     file = "publication_bias_results.rda")
+```
+
+# 4. Univariate location-scale models
+
+```{r univariate-analysis}
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+NULL_F  <- ~ 1
+ROB_VAR <- "rob_score"
+
+# Fit a location-scale model, trying several optimizers in turn. A fit counts
+# as converged only if all coefficients and SEs are finite and SEs < se_threshold.
+# scale_f = NULL (suicide attempts): location-only model, fitted as a standard
+# random-effects meta-regression. This is the same model as a location-scale
+# model with an intercept-only scale (identical likelihood, AICc and estimates),
+# but avoids failures of the location-scale starting values when a moderator
+# level contains a single comparison or tau^2 is estimated at zero.
+fit_lsm <- function(loc_f, scale_f, data, method = "ML", se_threshold = 100) {
+  opts <- list(
+    list(optimizer = "nlminb"),
+    list(optimizer = "optim", optmethod = "Nelder-Mead"),
+    list(optimizer = "optim", optmethod = "BFGS"),
+    list(optimizer = "nloptr")
+  )
+  for (ctrl in opts) {
+    fit <- suppressWarnings(tryCatch(
+      if (is.null(scale_f)) {
+        rma(yi, sei = sei, mods = loc_f, data = data, method = method, test = "knha")
+      } else {
+        rma(yi, sei = sei, mods = loc_f, scale = scale_f, data = data,
+            method = method, test = "knha", control = ctrl)
+      },
+      error = function(e) NULL))
+    ok <- !is.null(fit) &&
+          all(is.finite(c(fit$beta, fit$se))) &&
+          all(fit$se < se_threshold) &&
+          (is.null(fit$alpha) ||
+           (all(is.finite(c(fit$alpha, fit$se.alpha))) && all(fit$se.alpha < se_threshold)))
+    if (isTRUE(ok)) {
+      attr(fit, "optimizer") <- paste(unlist(ctrl), collapse = "-")
+      return(fit)
+    }
+  }
+  NULL
+}
+
+get_aicc <- function(m) if (is.null(m)) NA_real_ else summary(m)$fit.stats["AICc", "ML"]
+
+
+# ── Overall effect and heterogeneity ─────────────────────────────────────────
+
+null_si <- rma(yi, sei = sei, data = ideation_final, method = "REML", test = "knha")
+null_at <- rma(yi, sei = sei, data = attempt_final,  method = "REML", test = "knha")
+
+for (nm in c("Ideation", "Attempt")) {
+  m <- if (nm == "Ideation") null_si else null_at
+  cat(sprintf("%-9s estimate = %.4f  tau2 = %.4f  I2 = %.1f%%  Q(%d) = %.1f  p = %s\n",
+              nm, m$beta, m$tau2, m$I2, m$k - 1, m$QE, format.pval(m$QEp, digits = 3)))
+}
+
+# Scale component modelled for ideation only (see Overview, point 2)
+model_scale <- list(ideation = TRUE, attempt = FALSE)
+
+
+# ── Candidate moderators ─────────────────────────────────────────────────────
+
+moderator_info <- tribble(
+  ~name,                ~type,        ~domain,
+  "total_n10",          "continuous", "Study design and conduct",
+  "control",            "factor",     "Study design and conduct",
+  "time_weeks_c",       "continuous", "Study design and conduct",
+  "lmic",               "factor",     "Study design and conduct",
+  "direct",             "factor",     "Intervention",
+  "combi",              "factor",     "Intervention",
+  "family_involvement", "factor",     "Intervention",
+  "duration_arm1_n",    "continuous", "Intervention",
+  "disorder_suic",      "factor",     "Population",
+  "age_dich",           "factor",     "Population",
+  "pct_women_c",        "continuous", "Population",
+  "rob_score",          "continuous", "Covariate"
+)
+
+
+# ── Univariate models ────────────────────────────────────────────────────────
+# Moderator + RoB score in location (and scale, if modelled), on the
+# moderator's own complete cases. adjust_rob = FALSE drops the RoB covariate
+# (sensitivity analysis A).
+
+fit_univariate <- function(data, moderator, type, rob_var = ROB_VAR,
+                           with_scale = TRUE, min_per_level = 4, adjust_rob = TRUE) {
+  vars <- c("yi", "sei", moderator, if (adjust_rob) rob_var)
+  sub  <- data %>% select(all_of(unique(vars))) %>% drop_na()
+
+  if (nrow(sub) < 10) {
+    message("Skipping ", moderator, ": fewer than 10 comparisons.")
+    return(NULL)
+  }
+  if (type == "factor") {
+    sub[[moderator]] <- droplevels(factor(sub[[moderator]]))
+    tab <- table(sub[[moderator]])
+    if (length(tab) < 2 || any(tab < min_per_level)) {
+      message("Skipping ", moderator, ": a level has fewer than ", min_per_level, " comparisons.")
+      return(NULL)
+    }
+  }
+
+  rhs <- if (!adjust_rob || moderator == rob_var) moderator else paste(moderator, "+", rob_var)
+  loc_f   <- as.formula(paste("~", rhs))
+  scale_f <- if (with_scale) loc_f else NULL
+
+  fit <- fit_lsm(loc_f, scale_f, sub, method = "REML")
+  if (is.null(fit)) {
+    message("Model for ", moderator, " did not converge.")
+    return(NULL)
+  }
+  list(fit = fit, data = sub, moderator = moderator, type = type,
+       loc_f = loc_f, scale_f = scale_f, with_scale = with_scale,
+       rob_var = rob_var, adjust_rob = adjust_rob)
+}
+
+run_univariate <- function(data, label, with_scale) {
+  cat("\n=====", label, "=====\n")
+  res <- pmap(list(moderator = moderator_info$name, type = moderator_info$type),
+              function(moderator, type) fit_univariate(data, moderator, type, with_scale = with_scale))
+  names(res) <- moderator_info$name
+  res <- compact(res)
+  cat("Estimated:", length(res), "of", nrow(moderator_info), "\n")
+  not_run <- setdiff(moderator_info$name, names(res))
+  if (length(not_run)) cat("Not estimated:", paste(not_run, collapse = ", "), "\n")
+  res
+}
+
+uni_si <- run_univariate(ideation_final, "Suicidal ideation", model_scale$ideation)
+uni_at <- run_univariate(attempt_final,  "Suicide attempts",  model_scale$attempt)
+
+
+# ── Likelihood ratio tests (ML): moderator + RoB vs. RoB only ────────────────
+
+lrt_lsm <- function(res) {
+  if (is.null(res) || res$moderator == res$rob_var) return(NULL)
+  d     <- res$data
+  rob_f <- as.formula(paste("~", res$rob_var))
+
+  full <- fit_lsm(res$loc_f, res$scale_f, d, method = "ML")
+  if (is.null(full)) return(NULL)
+  base <- fit_lsm(rob_f, if (res$with_scale) rob_f else NULL, d, method = "ML")
+  if (is.null(base))
+    return(list(moderator = res$moderator, k = nrow(d), omni_df = NA_real_, omni_p = NA_real_))
+
+  a <- anova(full, base)
+  list(moderator = res$moderator, k = nrow(d), omni_df = a$parms.f - a$parms.r, omni_p = a$pval)
+}
+
+lrt_si <- compact(map(uni_si, lrt_lsm))
+lrt_at <- compact(map(uni_at, lrt_lsm))
+
+cat("\n--- LRT: ideation ---\n"); print(bind_rows(lrt_si) %>% mutate(omni_p = signif(omni_p, 3)), n = Inf)
+cat("\n--- LRT: attempts ---\n"); print(bind_rows(lrt_at) %>% mutate(omni_p = signif(omni_p, 3)), n = Inf)
+
+
+# ── Coefficients: Wald CIs for beta, profile-likelihood CIs for alpha ────────
+
+extract_coefs <- function(res) {
+  if (is.null(res)) return(NULL)
+  f <- res$fit
+  loc <- tibble(moderator = res$moderator, component = "location",
+                term = rownames(f$beta), estimate = as.numeric(f$beta),
+                ci.lb = f$ci.lb, ci.ub = f$ci.ub, stat = f$zval, p = f$pval)
+  if (is.null(f$alpha)) return(loc)
+
+  sc <- tibble(moderator = res$moderator, component = "scale",
+               term = rownames(f$alpha), estimate = as.numeric(f$alpha),
+               stat = f$zval.alpha, p = f$pval.alpha,
+               ci.lb = f$ci.lb.alpha, ci.ub = f$ci.ub.alpha)   # Wald fallback
+
+  pci <- tryCatch(confint(f), error = function(e) NULL)
+  prof <- if (is.null(pci)) NULL else tryCatch(
+    do.call(rbind, lapply(pci[sapply(pci, function(x) is.list(x) && !is.null(x$random))],
+                          function(x) x$random)),
+    error = function(e) NULL)
+  if (!is.null(prof) && nrow(prof) == nrow(sc)) {
+    sc$ci.lb <- prof[, "ci.lb"]
+    sc$ci.ub <- prof[, "ci.ub"]
+  } else {
+    message("Profile-likelihood CI unavailable for ", res$moderator, "; using Wald CI.")
+  }
+  bind_rows(loc, sc)
+}
+
+coefs_si <- map_dfr(uni_si, extract_coefs)
+coefs_at <- map_dfr(uni_at, extract_coefs)
+
+cat("\n--- Coefficients: ideation ---\n")
+print(coefs_si %>% filter(!grepl("intrcpt", term)) %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+cat("\n--- Coefficients: attempts ---\n")
+print(coefs_at %>% filter(!grepl("intrcpt", term)) %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+
+
+# ── Permutation tests ────────────────────────────────────────────────────────
+# For moderators significant in the LRT or any Wald test: permute the
+# moderator across comparisons, refit, and compare the largest |z| of the
+# moderator's coefficients against its permutation distribution.
+
+permutation_test <- function(data, moderator, with_scale, n_perm = 1000,
+                             rob_var = ROB_VAR, seed = 2026) {
+  set.seed(seed)
+  sub <- data %>% select(all_of(c("yi", "sei", moderator, rob_var))) %>% drop_na()
+  loc_f   <- as.formula(paste("~", moderator, "+", rob_var))
+  scale_f <- if (with_scale) loc_f else NULL
+
+  obs <- fit_lsm(loc_f, scale_f, sub, method = "REML")
+  if (is.null(obs)) return(NULL)
+
+  stat_of <- function(m) {
+    idx_loc <- grep(paste0("^", moderator), rownames(m$beta))
+    s_loc <- if (length(idx_loc)) max(abs(m$zval[idx_loc])) else NA_real_
+    if (is.null(m$alpha)) return(c(location = s_loc, scale = NA_real_))
+    idx_sc <- grep(paste0("^", moderator), rownames(m$alpha))
+    s_sc <- if (length(idx_sc)) max(abs(m$zval.alpha[idx_sc])) else NA_real_
+    c(location = s_loc, scale = s_sc)
+  }
+
+  obs_stat  <- stat_of(obs)
+  null_stat <- matrix(NA_real_, nrow = n_perm, ncol = 2,
+                      dimnames = list(NULL, c("location", "scale")))
+  for (i in seq_len(n_perm)) {
+    perm <- sub
+    perm[[moderator]] <- sample(perm[[moderator]])
+    m <- fit_lsm(loc_f, scale_f, perm, method = "REML")
+    if (!is.null(m)) null_stat[i, ] <- stat_of(m)
+  }
+
+  tibble(
+    moderator    = moderator, k = nrow(sub),
+    stat_loc     = obs_stat["location"],
+    p_perm_loc   = mean(null_stat[, "location"] >= obs_stat["location"], na.rm = TRUE),
+    stat_scale   = obs_stat["scale"],
+    p_perm_scale = if (with_scale) mean(null_stat[, "scale"] >= obs_stat["scale"], na.rm = TRUE) else NA_real_,
+    n_converged  = sum(!is.na(null_stat[, 1]))
+  )
+}
+
+flag_for_permutation <- function(lrt_list, coefs) {
+  lrt_flagged  <- bind_rows(lrt_list) %>% filter(omni_p < .05) %>% pull(moderator)
+  wald_flagged <- coefs %>%
+    filter(!grepl("intrcpt", term), !grepl(paste0("^", ROB_VAR), term), p < .05) %>%
+    pull(moderator)
+  intersect(moderator_info$name, union(lrt_flagged, wald_flagged))
+}
+
+perm_candidates_si <- flag_for_permutation(lrt_si, coefs_si)
+perm_candidates_at <- flag_for_permutation(lrt_at, coefs_at)
+cat("\nPermutation tests for (ideation):", paste(perm_candidates_si, collapse = ", "), "\n")
+cat("Permutation tests for (attempts):",   paste(perm_candidates_at, collapse = ", "), "\n")
+
+perm_si <- map_dfr(perm_candidates_si, ~ permutation_test(ideation_final, .x, model_scale$ideation))
+perm_at <- map_dfr(perm_candidates_at, ~ permutation_test(attempt_final,  .x, model_scale$attempt))
+
+print(perm_si %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+print(perm_at %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+
+save(null_si, null_at, uni_si, uni_at, lrt_si, lrt_at, coefs_si, coefs_at,
+     perm_si, perm_at, perm_candidates_si, perm_candidates_at,
+     file = "univariate_results.rda")
+```
+
+# 5. Multi-model selection
+
+```{r multimodel-selection}
+# ── Candidate set and analytic sample ────────────────────────────────────────
+# Family involvement is examined in univariate models only (overlaps with
+# delivery format and age group); the remaining 11 moderators, including RoB
+# score, are candidates. All candidate models are fitted on the same
+# complete-case sample so that AICc values are comparable.
+
+MM_EXCLUDE <- "family_involvement"
+full_mods  <- setdiff(moderator_info$name, MM_EXCLUDE)
+MAX_SIZE   <- 4
+
+mm_data_si <- ideation_final %>% drop_na(all_of(full_mods))
+mm_data_at <- attempt_final  %>% drop_na(all_of(full_mods))
+
+cat("Candidates (", length(full_mods), "):", paste(full_mods, collapse = ", "), "\n")
+cat("Ideation analytic sample:", nrow(mm_data_si), "of", nrow(ideation_final), "\n")
+cat("Attempt analytic sample: ", nrow(mm_data_at), "of", nrow(attempt_final),  "\n")
+cat("\nMissing values per candidate moderator (ideation / attempts):\n")
+print(rbind(ideation = colSums(is.na(ideation_final[full_mods])),
+            attempt  = colSums(is.na(attempt_final[full_mods]))))
+
+
+# ── Collinearity screening ───────────────────────────────────────────────────
+# Association on a common 0-1 scale: |r| (continuous x continuous), Cramér's V
+# (factor x factor), correlation ratio sqrt(eta^2) (factor x continuous).
+# Pairs at or above the a priori threshold may not enter the same model.
+
+COLLIN_THRESHOLD <- 0.6
+
+assoc_strength <- function(x, y) {
+  x_num <- is.numeric(x); y_num <- is.numeric(y)
+  if (x_num && y_num) return(abs(suppressWarnings(cor(x, y, use = "pairwise.complete.obs"))))
+  if (!x_num && !y_num) {
+    tab <- table(droplevels(factor(x)), droplevels(factor(y)))
+    if (any(dim(tab) < 2)) return(NA_real_)
+    chi <- suppressWarnings(chisq.test(tab, correct = FALSE))
+    return(sqrt(as.numeric(chi$statistic) / (sum(tab) * (min(dim(tab)) - 1))))
+  }
+  if (x_num) { cont <- x; grp <- y } else { cont <- y; grp <- x }
+  grp <- droplevels(factor(grp))
+  if (nlevels(grp) < 2) return(NA_real_)
+  fit <- tryCatch(aov(cont ~ grp), error = function(e) NULL)
+  if (is.null(fit)) return(NA_real_)
+  ss <- summary(fit)[[1]][["Sum Sq"]]
+  sqrt(ss[1] / sum(ss))
+}
+
+find_collinear_pairs <- function(data, mods, threshold = COLLIN_THRESHOLD) {
+  map_dfr(combn(mods, 2, simplify = FALSE), function(p) {
+    sub <- data %>% select(all_of(p)) %>% drop_na()
+    v <- tryCatch(assoc_strength(sub[[p[1]]], sub[[p[2]]]), error = function(e) NA_real_)
+    tibble(var1 = p[1], var2 = p[2], k = nrow(sub), assoc = v)
+  }) %>% filter(!is.na(assoc) & assoc >= threshold) %>% arrange(desc(assoc))
+}
+
+collin_si <- find_collinear_pairs(mm_data_si, full_mods)
+collin_at <- find_collinear_pairs(mm_data_at, full_mods)
+cat("\n--- Excluded pairs (ideation) ---\n"); print(collin_si)
+cat("\n--- Excluded pairs (attempts) ---\n"); print(collin_at)
+
+pairs_to_list <- function(tab) lapply(seq_len(nrow(tab)), function(i) c(tab$var1[i], tab$var2[i]))
+exclude_pairs_si <- pairs_to_list(collin_si)
+exclude_pairs_at <- pairs_to_list(collin_at)
+
+
+# ── Model space, fitting and averaging ───────────────────────────────────────
+
+# All combinations of 0..max_size moderators, minus those containing an
+# excluded pair. `force` adds variables to every model (sensitivity analysis B).
+# Location and scale always receive the same moderators.
+build_formulas <- function(mods, max_size, with_scale = TRUE, exclude_pairs = list(),
+                           force = character(0)) {
+  combos <- unlist(lapply(0:min(max_size, length(mods)), function(s)
+    if (s == 0) list(character(0)) else combn(mods, s, simplify = FALSE)), recursive = FALSE)
+
+  if (length(exclude_pairs)) {
+    keep <- vapply(combos, function(cm) {
+      vars <- union(cm, force)
+      !any(vapply(exclude_pairs, function(pr) all(pr %in% vars), logical(1)))
+    }, logical(1))
+    combos <- combos[keep]
+  }
+
+  lapply(combos, function(cm) {
+    terms <- c(cm, force)
+    loc   <- if (length(terms)) as.formula(paste("~", paste(terms, collapse = " + "))) else NULL_F
+    list(loc = loc, scale = if (with_scale) loc else NULL, mods = cm)
+  })
+}
+
+fit_all <- function(fp, data, label) {
+  fits <- lapply(fp, function(f) fit_lsm(f$loc, f$scale, data, method = "ML"))
+  keep <- !vapply(fits, is.null, logical(1))
+  cat(sprintf("%-32s converged %4d / %4d  (k = %d)\n", label, sum(keep), length(fp), nrow(data)))
+  list(fits = fits[keep], fp = fp[keep], n_total = length(fp),
+       n_converged = sum(keep), failed_fp = fp[!keep])
+}
+
+akaike_weights <- function(aicc) {
+  w <- exp(-(aicc - min(aicc, na.rm = TRUE)) / 2)
+  w / sum(w, na.rm = TRUE)
+}
+
+# Full model averaging: coefficients absent from a model count as 0.
+# Unconditional SE (Burnham & Anderson, 2002); Wald z/p as in Kuper et al. (2025),
+# not adjusted for model selection.
+model_average <- function(fits, weights) {
+  params <- unique(unlist(lapply(fits, function(m)
+    c(paste0("loc_", rownames(m$beta)), if (!is.null(m$alpha)) paste0("scale_", rownames(m$alpha))))))
+
+  coef_mat    <- matrix(0, length(fits), length(params), dimnames = list(NULL, params))
+  se_mat      <- coef_mat
+  present_mat <- matrix(FALSE, length(fits), length(params), dimnames = list(NULL, params))
+
+  for (i in seq_along(fits)) {
+    m  <- fits[[i]]
+    lp <- paste0("loc_", rownames(m$beta))
+    coef_mat[i, lp] <- as.numeric(m$beta); se_mat[i, lp] <- m$se; present_mat[i, lp] <- TRUE
+    if (!is.null(m$alpha)) {
+      sp <- paste0("scale_", rownames(m$alpha))
+      coef_mat[i, sp] <- as.numeric(m$alpha); se_mat[i, sp] <- m$se.alpha; present_mat[i, sp] <- TRUE
+    }
+  }
+
+  avg    <- colSums(weights * coef_mat)
+  avg_se <- sqrt(colSums(weights * (se_mat^2 + sweep(coef_mat, 2, avg, "-")^2)))
+  z      <- avg / avg_se
+
+  tibble(parameter = params, estimate = avg, se = avg_se, z = z,
+         p = 2 * pnorm(-abs(z)),
+         ci.lb = avg - 1.96 * avg_se, ci.ub = avg + 1.96 * avg_se,
+         importance = colSums(weights * present_mat)) %>%
+    arrange(desc(importance), parameter)
+}
+
+run_multimodel <- function(data, mods, label, with_scale, max_size = MAX_SIZE,
+                           exclude_pairs = list(), force = character(0)) {
+  fp  <- build_formulas(mods, max_size, with_scale, exclude_pairs, force)
+  res <- fit_all(fp, data, label)
+  if (res$n_converged == 0) return(NULL)
+  aicc <- vapply(res$fits, get_aicc, numeric(1))
+  w    <- akaike_weights(aicc)
+  list(avg = model_average(res$fits, w), weights = w, aicc = aicc,
+       res = res, data = data, fp = fp, label = label)
+}
+
+rank_models_tbl <- function(mm, n_show = 10) {
+  delta <- mm$aicc - min(mm$aicc, na.rm = TRUE)
+  tibble(moderators = vapply(mm$res$fp, function(f)
+           if (length(f$mods)) paste(f$mods, collapse = " + ") else "(intercept only)", character(1)),
+         aicc = round(mm$aicc, 2), delta = round(delta, 2), weight = round(mm$weights, 4)) %>%
+    arrange(delta) %>% mutate(rank = row_number(), .before = 1) %>%
+    slice_head(n = n_show)
+}
+
+print_mm <- function(mm) {
+  delta <- mm$aicc - min(mm$aicc, na.rm = TRUE)
+  cat("\n---", mm$label, "---\n")
+  print(rank_models_tbl(mm), n = Inf)
+  cat("Models within 2 AICc units of the best:", sum(delta <= 2, na.rm = TRUE), "\n")
+  print(mm$avg %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+}
+
+
+# ── Primary analysis ─────────────────────────────────────────────────────────
+
+mm_si <- run_multimodel(mm_data_si, full_mods, "Ideation, primary",
+                        with_scale = model_scale$ideation, exclude_pairs = exclude_pairs_si)
+mm_at <- run_multimodel(mm_data_at, full_mods, "Attempts, primary",
+                        with_scale = model_scale$attempt, exclude_pairs = exclude_pairs_at)
+print_mm(mm_si)
+print_mm(mm_at)
+
+save(mm_si, mm_at, collin_si, collin_at, exclude_pairs_si, exclude_pairs_at, full_mods,
+     file = "multimodel_results.rda")
+```
+
+# 6. Sensitivity analyses
+
+```{r sensitivity-rob}
+# ── A. Univariate models with vs. without RoB adjustment ─────────────────────
+
+# The moderator's own coefficient: row 2 of beta/alpha (for factors, the
+# first non-reference level).
+own_coef <- function(res) {
+  if (is.null(res)) return(NULL)
+  f <- res$fit
+  out <- tibble(moderator = res$moderator, component = "location",
+                term = rownames(f$beta)[2], estimate = f$beta[2], se = f$se[2], p = f$pval[2])
+  if (!is.null(f$alpha))
+    out <- bind_rows(out, tibble(moderator = res$moderator, component = "scale",
+                                 term = rownames(f$alpha)[2], estimate = f$alpha[2],
+                                 se = f$se.alpha[2], p = f$pval.alpha[2]))
+  out
+}
+
+compare_wide <- function(tab, a, b) {
+  tab %>%
+    select(moderator, component, spec, estimate, se, p) %>%
+    pivot_wider(names_from = spec, values_from = c(estimate, se, p)) %>%
+    mutate(delta_estimate = .data[[paste0("estimate_", a)]] - .data[[paste0("estimate_", b)]],
+           pct_change = round(100 * delta_estimate / abs(.data[[paste0("estimate_", b)]]), 1))
+}
+
+run_rob_sensitivity_univariate <- function(data, with_scale) {
+  tag <- function(x, spec) if (is.null(x)) NULL else mutate(x, spec = spec)
+  map2_dfr(moderator_info$name, moderator_info$type, function(moderator, type) {
+    if (moderator == ROB_VAR) return(NULL)   # moderators not estimable are skipped
+    bind_rows(
+      tag(own_coef(fit_univariate(data, moderator, type, with_scale = with_scale, adjust_rob = TRUE)),
+          "with_RoB"),
+      tag(own_coef(fit_univariate(data, moderator, type, with_scale = with_scale, adjust_rob = FALSE)),
+          "without_RoB"))
+  })
+}
+
+uni_rob_sens_si <- run_rob_sensitivity_univariate(ideation_final, model_scale$ideation)
+uni_rob_sens_at <- run_rob_sensitivity_univariate(attempt_final,  model_scale$attempt)
+
+cat("\n--- Ideation: with vs. without RoB ---\n")
+print(compare_wide(uni_rob_sens_si, "with_RoB", "without_RoB") %>%
+        mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+cat("\n--- Attempts: with vs. without RoB ---\n")
+print(compare_wide(uni_rob_sens_at, "with_RoB", "without_RoB") %>%
+        mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+
+
+# ── B. Multi-model selection with RoB forced into every model ────────────────
+# Same analytic sample and excluded pairs as the primary analysis.
+
+mods_substantive <- setdiff(full_mods, ROB_VAR)
+
+mm_si_forced <- run_multimodel(mm_data_si, mods_substantive, "Ideation, RoB forced",
+                               with_scale = model_scale$ideation,
+                               exclude_pairs = exclude_pairs_si, force = ROB_VAR)
+mm_at_forced <- run_multimodel(mm_data_at, mods_substantive, "Attempts, RoB forced",
+                               with_scale = model_scale$attempt,
+                               exclude_pairs = exclude_pairs_at, force = ROB_VAR)
+
+# Compare two multi-model fits on estimate, importance and p
+compare_multimodel <- function(mm_a, mm_b, a = "primary", b = "alt", drop = NULL) {
+  pick <- function(mm, s) {
+    d <- mm$avg
+    if (!is.null(drop)) d <- filter(d, !grepl(drop, parameter))
+    d %>% select(parameter, estimate, importance, p) %>%
+      rename_with(~ paste0(., "_", s), -parameter)
+  }
+  full_join(pick(mm_a, a), pick(mm_b, b), by = "parameter") %>%
+    mutate(d_importance = round(.data[[paste0("importance_", b)]] - .data[[paste0("importance_", a)]], 3)) %>%
+    arrange(desc(pmax(.data[[paste0("importance_", a)]], .data[[paste0("importance_", b)]], na.rm = TRUE)))
+}
+
+# RoB score itself is excluded (importance = 1 by construction when forced)
+cmp_si <- compare_multimodel(mm_si, mm_si_forced, "compete", "forced", drop = ROB_VAR)
+cmp_at <- compare_multimodel(mm_at, mm_at_forced, "compete", "forced", drop = ROB_VAR)
+print(cmp_si %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+print(cmp_at %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+
+save(uni_rob_sens_si, uni_rob_sens_at, mm_si_forced, mm_at_forced, cmp_si, cmp_at,
+     file = "sensitivity_rob_results.rda")
+```
+
+```{r sensitivity-influence-outliers}
+# Influential cases and outliers are identified once, from the moderator-free
+# model of each outcome. Both stages are then refitted without them.
+#   C. Influential: metafor::influence() default rule (Viechtbauer & Cheung, 2010)
+#   D. Outliers:    |externally studentized residual| > 3
+
+# Univariate stage: refit the moderators estimated in the primary analysis
+compare_own_coef <- function(fit_list_full, data_reduced, with_scale) {
+  full <- map_dfr(fit_list_full, own_coef) %>% mutate(spec = "full")
+  excl <- map_dfr(names(fit_list_full), function(m) {
+    type <- moderator_info$type[moderator_info$name == m]
+    own_coef(fit_univariate(data_reduced, m, type, with_scale = with_scale))
+  })
+  if (nrow(excl) == 0) {
+    message("No univariate model could be refitted after exclusion.")
+    return(NULL)
+  }
+  compare_wide(bind_rows(full, mutate(excl, spec = "excluded")), "excluded", "full")
+}
+
+run_exclusion_sensitivity <- function(data, flag, uni_fit_list, with_scale, exclude_pairs, label) {
+  if (sum(flag, na.rm = TRUE) == 0) {
+    cat("\n", label, ": no comparisons flagged; identical to primary analysis, skipped.\n")
+    return(NULL)
+  }
+  data_reduced <- data[!flag, ]
+  cat("\n", label, ": excluded", sum(flag), "->", paste(data$study[flag], collapse = "; "), "\n")
+  list(
+    uni = compare_own_coef(uni_fit_list, data_reduced, with_scale),
+    mm  = run_multimodel(drop_na(data_reduced, all_of(full_mods)), full_mods, label,
+                         with_scale = with_scale, exclude_pairs = exclude_pairs)
+  )
+}
+
+infl_si <- influence(null_si)
+infl_at <- influence(null_at)
+
+infl_flag_si <- infl_si$is.infl
+infl_flag_at <- infl_at$is.infl
+out_flag_si  <- abs(infl_si$inf$rstudent) > 3
+out_flag_at  <- abs(infl_at$inf$rstudent) > 3
+out_flag_si[is.na(out_flag_si)] <- FALSE
+out_flag_at[is.na(out_flag_at)] <- FALSE
+
+sens_infl_si <- run_exclusion_sensitivity(ideation_final, infl_flag_si, uni_si, model_scale$ideation,
+                                          exclude_pairs_si, "Ideation, excl. influential")
+sens_infl_at <- run_exclusion_sensitivity(attempt_final,  infl_flag_at, uni_at, model_scale$attempt,
+                                          exclude_pairs_at, "Attempts, excl. influential")
+sens_out_si  <- run_exclusion_sensitivity(ideation_final, out_flag_si,  uni_si, model_scale$ideation,
+                                          exclude_pairs_si, "Ideation, excl. outliers")
+sens_out_at  <- run_exclusion_sensitivity(attempt_final,  out_flag_at,  uni_at, model_scale$attempt,
+                                          exclude_pairs_at, "Attempts, excl. outliers")
+
+mm_si_excl_infl <- sens_infl_si$mm
+mm_at_excl_infl <- sens_infl_at$mm
+
+show_sens <- function(sens, mm_primary) {
+  if (is.null(sens)) return(invisible(NULL))
+  if (!is.null(sens$uni)) print(sens$uni %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+  if (is.null(sens$mm)) return(invisible(NULL))
+  cmp <- compare_multimodel(mm_primary, sens$mm, "full", "excluded")
+  print(cmp %>% mutate(across(where(is.numeric), ~ round(., 4))), n = Inf)
+  invisible(cmp)
+}
+
+cmp_infl_mm_si <- show_sens(sens_infl_si, mm_si)
+cmp_infl_mm_at <- show_sens(sens_infl_at, mm_at)
+cmp_out_mm_si  <- show_sens(sens_out_si,  mm_si)
+cmp_out_mm_at  <- show_sens(sens_out_at,  mm_at)
+
+save(infl_flag_si, infl_flag_at, out_flag_si, out_flag_at,
+     sens_infl_si, sens_infl_at, sens_out_si, sens_out_at,
+     mm_si_excl_infl, mm_at_excl_infl,
+     cmp_infl_mm_si, cmp_infl_mm_at, cmp_out_mm_si, cmp_out_mm_at,
+     file = "sensitivity_influence_outlier_results.rda")
+```
+
+# 7. Supplementary figures and tables
+
+```{r visualization-setup}
+theme_lsm <- theme_bw(base_size = 11) +
+  theme(panel.grid.minor = element_blank(),
+        plot.title = element_text(face = "bold", size = 12),
+        strip.background = element_rect(fill = "grey90"))
+
+tbl_grob <- function(tab, size = 8) {
+  tableGrob(tab, rows = NULL, theme = ttheme_minimal(
+    core = list(fg_params = list(fontsize = size)),
+    colhead = list(fg_params = list(fontsize = size, fontface = "bold"))))
+}
+
+# ── RoB summary ──────────────────────────────────────────────────────────────
+ROB_LABELS <- c("D1: Randomization Process", "D2: Intervention Deviations", "D3: Missing Data",
+                "D4: Outcome Measurement", "D5: Selective Outcome Reporting")
+
+plot_rob_summary <- function(master, ids, domain_cols, overall_col, title) {
+  sub <- master %>% filter(id %in% ids) %>% select(id, all_of(domain_cols), Overall = all_of(overall_col))
+  long <- sub %>%
+    pivot_longer(-id, names_to = "domain", values_to = "rating") %>%
+    mutate(domain = recode(domain, !!!setNames(ROB_LABELS, domain_cols)),
+           domain = factor(domain, levels = rev(c(ROB_LABELS, "Overall"))),
+           rating = factor(rating, levels = c("low", "some concerns", "high"),
+                           labels = c("Low risk", "Some concerns", "High risk")))
+  summ <- long %>% filter(!is.na(rating)) %>% count(domain, rating) %>%
+    group_by(domain) %>% mutate(pct = n / sum(n) * 100) %>% ungroup()
+  ggplot(summ, aes(x = domain, y = pct, fill = rating)) +
+    geom_col(width = 0.7, color = "white") +
+    coord_flip() +
+    scale_fill_manual(values = c("Low risk" = "#2ca25f", "Some concerns" = "#fdae61",
+                                 "High risk" = "#d73027"), name = NULL) +
+    scale_y_continuous(labels = function(x) paste0(x, "%"), expand = c(0, 0)) +
+    labs(title = title, subtitle = paste0("k = ", n_distinct(sub$id), " studies"),
+         x = NULL, y = "Percent of studies") +
+    theme_lsm + theme(legend.position = "bottom")
+}
+
+# ── Funnel plots ─────────────────────────────────────────────────────────────
+plot_funnel <- function(data, pooled, title, subtitle = NULL, by_income = FALSE) {
+  se_max <- max(data$sei, na.rm = TRUE) * 1.05
+  se_seq <- seq(0, se_max, length.out = 100)
+  fdf    <- tibble(se = se_seq, lo = pooled - 1.96 * se_seq, hi = pooled + 1.96 * se_seq)
+  p <- ggplot() +
+    geom_path(data = fdf, aes(x = lo, y = se), linetype = "dashed", color = "grey55") +
+    geom_path(data = fdf, aes(x = hi, y = se), linetype = "dashed", color = "grey55") +
+    geom_vline(xintercept = pooled, color = "grey30", linewidth = 0.5)
+  p <- if (by_income) {
+    p + geom_point(data = data, aes(x = yi, y = sei, fill = lmic), shape = 21, color = "grey20",
+                   alpha = 0.8, size = 2.2) +
+      scale_fill_manual(values = c(hic = "#2a78d6", lmic = "#eb6834"), name = "Income level",
+                        labels = c(hic = "HIC", lmic = "LMIC"), na.translate = FALSE)
+  } else {
+    p + geom_point(data = data, aes(x = yi, y = sei), shape = 21, fill = "#2a78d6",
+                   color = "#184f95", alpha = 0.75, size = 2.2)
+  }
+  p + scale_y_reverse(limits = c(se_max, 0)) +
+    labs(title = title, subtitle = subtitle, x = "Effect size", y = "Standard error") +
+    theme_lsm
+}
+
+# ── Univariate coefficient table ─────────────────────────────────────────────
+fmt_est_ci <- function(est, lb, ub) sprintf("%.3f [%.3f, %.3f]", est, lb, ub)
+fmt_p      <- function(p) ifelse(p < .001, "<.001", sprintf("%.3f", p))
+
+build_univariate_table <- function(uni_fit_list, coefs_df, with_scale) {
+  k_tbl <- tibble(moderator = names(uni_fit_list),
+                  k = vapply(uni_fit_list, function(f) nrow(f$data), integer(1)))
+  df  <- coefs_df %>% filter(!grepl("intrcpt", term))
+  out <- df %>% filter(component == "location") %>%
+    transmute(moderator, term, Beta_95CI = fmt_est_ci(estimate, ci.lb, ci.ub), p_beta = fmt_p(p))
+  if (with_scale)
+    out <- full_join(out, df %>% filter(component == "scale") %>%
+                       transmute(moderator, term, Alpha_95PLCI = fmt_est_ci(estimate, ci.lb, ci.ub),
+                                 p_alpha = fmt_p(p)),
+                     by = c("moderator", "term"))
+  out %>% left_join(k_tbl, by = "moderator") %>% relocate(k, .after = term) %>%
+    rename(Moderator = moderator, Term = term, N = k)
+}
+
+# ── Association heatmaps (lower triangle) ────────────────────────────────────
+SEQ_BLUE <- c("#f7fbff", "#cde2fb", "#9ec5f4", "#5598e7", "#2a78d6", "#184f95", "#0d366b")
+DIV_BR   <- c("#0d366b", "#2a78d6", "#f0efec", "#e34948", "#7a1616")
+
+render_lower_triangle <- function(full, mods, limits, title, legend_title, diverging = FALSE) {
+  pal <- if (diverging) DIV_BR else SEQ_BLUE
+  full$var1 <- factor(full$var1, levels = mods)
+  full$var2 <- factor(full$var2, levels = rev(mods))
+  full$is_diag  <- as.character(full$var1) == as.character(full$var2)
+  full$fill_val <- ifelse(full$is_diag, NA_real_, full$val)
+  # label colour from cell luminance
+  nv  <- pmin(pmax((full$fill_val - limits[1]) / diff(limits), 0), 1)
+  rgb <- colorRamp(pal)(ifelse(is.na(nv), 0.15, nv))
+  lum <- (0.299 * rgb[, 1] + 0.587 * rgb[, 2] + 0.114 * rgb[, 3]) / 255
+  full$text_col <- ifelse(full$is_diag, "grey40", ifelse(lum > 0.55, "#0b0b0b", "#ffffff"))
+
+  ggplot(full, aes(x = var1, y = var2)) +
+    geom_tile(aes(fill = fill_val), color = "white", linewidth = 0.6) +
+    geom_text(aes(label = ifelse(is.na(val), "", sprintf("%.2f", val)), color = text_col),
+              size = 3.4, fontface = "bold", na.rm = TRUE) +
+    scale_color_identity() +
+    scale_fill_gradientn(colors = pal, limits = limits, na.value = "grey88", name = legend_title,
+                         guide = guide_colorbar(barwidth = 14, barheight = 0.6,
+                                                title.position = "top", title.hjust = 0.5)) +
+    labs(title = title, x = NULL, y = NULL) +
+    coord_fixed() +
+    theme_minimal(base_size = 11) +
+    theme(plot.title = element_text(face = "bold", size = 12),
+          axis.text.x = element_text(angle = 45, hjust = 1),
+          panel.grid = element_blank(), legend.position = "bottom")
+}
+
+pairwise_lower <- function(data, mods, fn) {
+  vals <- map_dfr(combn(mods, 2, simplify = FALSE), function(p) {
+    sub <- data %>% select(all_of(p)) %>% drop_na()
+    tibble(var1 = p[2], var2 = p[1],
+           val = tryCatch(fn(sub[[p[1]]], sub[[p[2]]]), error = function(e) NA_real_))
+  })
+  bind_rows(vals, tibble(var1 = mods, var2 = mods, val = 1))
+}
+
+plot_assoc_heatmap <- function(data, mods, title) {
+  render_lower_triangle(pairwise_lower(data, mods, assoc_strength), mods, c(0, 1), title,
+                        "Association\nstrength")
+}
+
+plot_corr_heatmap_continuous <- function(data, cont_vars, var_labels, title) {
+  full <- pairwise_lower(data, cont_vars, function(x, y) cor(x, y, use = "pairwise.complete.obs"))
+  lbl  <- setNames(var_labels, cont_vars)
+  full$var1 <- lbl[full$var1]; full$var2 <- lbl[full$var2]
+  render_lower_triangle(full, var_labels, c(-1, 1), title, "Pearson r", diverging = TRUE)
+}
+
+# ── Univariate plots: bubble (continuous) and density (categorical) ──────────
+# Location: observed yi with the model-implied line (RoB held at its mean).
+# Scale: fitted tau^2 per comparison with the model-implied line.
+# Prediction for both model classes (rma.ls: ideation; rma.uni: attempts).
+# Methods are called directly because S3 dispatch can be masked.
+pred_fit <- function(fit, ...) {
+  if (inherits(fit, "rma.ls")) metafor:::predict.rma.ls(fit, ...) else metafor:::predict.rma(fit, ...)
+}
+bubble_predict_grid <- function(fo, n = 100) {
+  fit <- fo$fit; dat <- fo$data; mod <- fo$moderator; rv <- fo$rob_var
+  xseq <- seq(min(dat[[mod]], na.rm = TRUE), max(dat[[mod]], na.rm = TRUE), length.out = n)
+  nm <- if (mod == rv) matrix(xseq, ncol = 1, dimnames = list(NULL, mod)) else
+    matrix(cbind(xseq, mean(dat[[rv]], na.rm = TRUE)), ncol = 2, dimnames = list(NULL, c(mod, rv)))
+  pr  <- pred_fit(fit, newmods = nm)
+  out <- tibble(x = xseq, loc_pred = pr$pred, loc_lb = pr$ci.lb, loc_ub = pr$ci.ub)
+  if (fo$with_scale) {
+    ps <- pred_fit(fit, newscale = nm)   # log(tau^2) scale
+    out$sc_pred <- exp(ps$pred); out$sc_lb <- exp(ps$ci.lb); out$sc_ub <- exp(ps$ci.ub)
+  }
+  out
+}
+
+plot_bubble_continuous <- function(fo, mod_label, outcome_label) {
+  dat <- fo$data %>% mutate(w = 1 / sei^2, tau2_fit = fo$fit$tau2)
+  grid <- bubble_predict_grid(fo)
+  base <- function(y, ylab, comp, col, ribbon) {
+    ggplot() +
+      geom_ribbon(data = grid, aes(x = x, ymin = .data[[paste0(ribbon, "_lb")]],
+                                   ymax = .data[[paste0(ribbon, "_ub")]]), fill = col, alpha = 0.2) +
+      geom_line(data = grid, aes(x = x, y = .data[[paste0(ribbon, "_pred")]]), color = col, linewidth = 0.9) +
+      geom_point(data = dat, aes(x = .data[[fo$moderator]], y = .data[[y]], size = w),
+                 shape = 21, fill = "grey60", color = "grey30", alpha = 0.75) +
+      scale_size_continuous(name = "Weight\n(1/SE^2)", range = c(1.5, 8)) +
+      labs(title = paste0(outcome_label, " - ", mod_label, " (", comp, ")"), x = mod_label, y = ylab) +
+      theme_lsm
+  }
+  list(location = base("yi", "Effect size (yi)", "Location", "steelblue4", "loc"),
+       scale    = if (fo$with_scale) base("tau2_fit", expression("Estimate of " * tau^2),
+                                          "Scale", "firebrick4", "sc"))
+}
+
+plot_density_categorical <- function(fo, mod_label, outcome_label) {
+  dat <- fo$data %>% mutate(tau2_fit = fo$fit$tau2)
+  grp <- fo$moderator
+  n_lev <- nlevels(droplevels(factor(dat[[grp]])))
+  pal <- if (n_lev <= 8) brewer.pal(max(3, n_lev), "Set2")[seq_len(n_lev)] else viridis(n_lev)
+  base <- function(x, xlab, comp) {
+    ggplot(dat, aes(x = .data[[x]], fill = .data[[grp]], color = .data[[grp]])) +
+      geom_density(alpha = 0.35, linewidth = 0.8) +
+      geom_rug(alpha = 0.6) +
+      scale_fill_manual(values = pal, name = mod_label) +
+      scale_color_manual(values = pal, name = mod_label) +
+      labs(title = paste0(outcome_label, " - ", mod_label, " (", comp, ")"), x = xlab, y = "Density") +
+      theme_lsm
+  }
+  list(location = base("yi", "Effect size (yi)", "Location"),
+       scale    = if (fo$with_scale) base("tau2_fit", expression("Fitted " * tau^2), "Scale"))
+}
+
+# ── Profile likelihood (scale coefficients only; metafor profiles alpha only) ─
+plot_profile_grid <- function(uni_fit_list, outcome_label, steps = 20) {
+  panels <- list()
+  for (mod in names(uni_fit_list)) {
+    fo <- uni_fit_list[[mod]]
+    if (!isTRUE(fo$with_scale) || is.null(fo$fit$alpha)) next
+    an <- rownames(fo$fit$alpha)
+    keep <- if (mod == fo$rob_var) which(an != "intrcpt") else which(!an %in% c("intrcpt", fo$rob_var))
+    for (idx in keep) {
+      lbl <- if (length(keep) > 1) paste0(mod, ": ", an[idx]) else mod
+      pr <- tryCatch(suppressWarnings(metafor:::profile.rma.ls(
+              fo$fit, alpha = idx, plot = FALSE, progbar = FALSE, steps = steps)),
+            error = function(e) NULL)
+      if (!is.null(pr))
+        panels[[lbl]] <- tibble(x = pr$alpha, ll = pr$ll, mle = fo$fit$alpha[idx],
+                                maxll = max(pr$ll, na.rm = TRUE))
+    }
+  }
+  if (!length(panels)) return(NULL)
+  ggplot(bind_rows(panels, .id = "panel"), aes(x = x, y = ll)) +
+    geom_line(color = "steelblue4", linewidth = 0.8) +
+    geom_point(size = 0.8, color = "steelblue4") +
+    geom_vline(aes(xintercept = mle), linetype = "dotted", color = "grey30") +
+    geom_hline(aes(yintercept = maxll), linetype = "dotted", color = "grey30") +
+    facet_wrap(~ panel, scales = "free", ncol = 3) +
+    labs(title = paste0(outcome_label, " - Profile likelihood (scale coefficients)"),
+         x = expression(alpha), y = "Log-likelihood") +
+    theme_lsm
+}
+
+# ── Multi-model plots ────────────────────────────────────────────────────────
+plot_aicc_profile <- function(mm, title) {
+  df <- tibble(aicc = sort(mm$aicc)) %>% mutate(rank = row_number())
+  ggplot(df, aes(x = rank, y = aicc)) +
+    geom_point(size = 1.3, color = "grey30", alpha = 0.7) +
+    geom_hline(yintercept = min(df$aicc), color = "firebrick", linetype = "dashed") +
+    labs(title = title, subtitle = paste(nrow(df), "converged candidate models"),
+         x = "Model rank (best to worst)", y = "AICc") +
+    theme_lsm
+}
+
+# Importance is identical for loc_X and scale_X (same moderators in both
+# components), so one bar per moderator.
+plot_importance <- function(mm_avg, title) {
+  df <- mm_avg %>% filter(!parameter %in% c("loc_intrcpt", "scale_intrcpt")) %>%
+    mutate(param_short = sub("^(loc_|scale_)", "", parameter)) %>%
+    distinct(param_short, .keep_all = TRUE) %>%
+    arrange(importance) %>%
+    mutate(param_short = factor(param_short, levels = param_short))
+  ggplot(df, aes(x = param_short, y = importance)) +
+    geom_col(fill = "steelblue", width = 0.65) +
+    geom_hline(yintercept = 0.8, color = "firebrick", linetype = "dashed") +
+    coord_flip() + scale_y_continuous(limits = c(0, 1)) +
+    labs(title = title, x = NULL, y = "Importance (sum of Akaike weights)") +
+    theme_lsm
+}
+
+plot_coef_forest <- function(mm_avg, title, component = c("all", "loc", "scale")) {
+  component <- match.arg(component)
+  df <- mm_avg %>% filter(!parameter %in% c("loc_intrcpt", "scale_intrcpt"))
+  if (component != "all") df <- df %>% filter(startsWith(parameter, paste0(component, "_")))
+  df <- df %>%
+    mutate(comp = ifelse(startsWith(parameter, "scale_"), "Scale", "Location"),
+           param_short = sub("^(loc_|scale_)", "", parameter),
+           sig = ifelse(p < 0.05, "p < .05", "n.s.")) %>%
+    arrange(comp, estimate) %>%
+    mutate(row_id = factor(row_number(), labels = param_short))
+  p <- ggplot(df, aes(x = estimate, y = row_id, color = sig)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+    geom_errorbarh(aes(xmin = ci.lb, xmax = ci.ub), height = 0.2) +
+    geom_point(size = 2) +
+    scale_color_manual(values = c("p < .05" = "firebrick", "n.s." = "grey40"), name = NULL) +
+    labs(title = title, x = "Model-averaged estimate (95% CI)", y = NULL) +
+    theme_lsm
+  if (component == "all") p <- p + facet_wrap(~ comp, scales = "free", ncol = 1)
+  p
+}
+
+# Multi-model fits to plot: primary + sensitivity variants that exist
+mm_list <- list(
+  "Ideation (primary)"            = list(mm = mm_si,            comp = "all"),
+  "Attempt (primary)"             = list(mm = mm_at,            comp = "loc"),
+  "Ideation (RoB forced)"         = list(mm = mm_si_forced,     comp = "all"),
+  "Attempt (RoB forced)"          = list(mm = mm_at_forced,     comp = "loc"),
+  "Ideation (excl. influential)"  = list(mm = mm_si_excl_infl,  comp = "all"),
+  "Attempt (excl. influential)"   = list(mm = mm_at_excl_infl,  comp = "loc"),
+  "Ideation (excl. outliers)"     = list(mm = sens_out_si$mm,   comp = "all"),
+  "Attempt (excl. outliers)"      = list(mm = sens_out_at$mm,   comp = "loc")
+)
+mm_list <- Filter(function(x) !is.null(x$mm), mm_list)
+```
+
+```{r fig-rob-summary, fig.width = 8.5, fig.height = 5.5}
+print(plot_rob_summary(master, ideation_final$id, c("rob_1", "rob_2", "rob_3", "rob_4", "rob_5"),
+                       "rob_total_si", "Risk of bias - suicidal ideation"))
+print(plot_rob_summary(master, attempt_final$id, c("rob_1", "rob_2", "rob_3", "rob_4_at_use", "rob_5"),
+                       "rob_total_at2", "Risk of bias - suicide attempts"))
+```
+
+```{r fig-publication-bias, fig.width = 6.5, fig.height = 5}
+print(plot_funnel(ideation_final, as.numeric(egger_si$beta), "Suicidal ideation - funnel plot",
+                  sprintf("Egger's test: z = %.2f, p = %.3f", rt_si$zval, rt_si$pval)))
+print(plot_funnel(attempt_final, as.numeric(egger_at$beta), "Suicide attempts - funnel plot",
+                  sprintf("Egger's test: z = %.2f, p = %.3f", rt_at$zval, rt_at$pval)))
+print(plot_funnel(ideation_final, as.numeric(egger_si$beta),
+                  "Suicidal ideation - funnel plot by income level", by_income = TRUE))
+grid.arrange(tbl_grob(pub_bias_summary %>% mutate(across(where(is.numeric), ~ round(., 3)))),
+             top = "Egger's test and bias-adjusted estimates")
+```
+
+```{r tab-univariate, fig.width = 10.5, fig.height = 8}
+tab_si <- build_univariate_table(uni_si, coefs_si, model_scale$ideation)
+tab_at <- build_univariate_table(uni_at, coefs_at, model_scale$attempt)
+grid.arrange(tbl_grob(tab_si, 7.5), top = "Ideation - univariate coefficients (RoB-adjusted)")
+grid.arrange(tbl_grob(tab_at, 7.5), top = "Attempts - univariate coefficients (RoB-adjusted)")
+write.csv(tab_si, "univariate_coefficients_ideation.csv", row.names = FALSE)
+write.csv(tab_at, "univariate_coefficients_attempt.csv",  row.names = FALSE)
+```
+
+```{r fig-collinearity, fig.width = 8.5, fig.height = 8.5}
+# Drawn on the multi-model analytic samples, matching collin_si / collin_at
+print(plot_assoc_heatmap(mm_data_si, full_mods, "Ideation - moderator associations"))
+print(plot_assoc_heatmap(mm_data_at, full_mods, "Attempts - moderator associations"))
+
+cont_vars   <- c("total_n10", "time_weeks_c", "duration_arm1_n", "pct_women_c", "rob_score")
+cont_labels <- c("Total N (/10)", "Time (wks, c.)", "Duration (min)", "% Women (c.)", "RoB score")
+print(plot_corr_heatmap_continuous(mm_data_si, cont_vars, cont_labels,
+                                   "Ideation - continuous moderators (Pearson r)"))
+print(plot_corr_heatmap_continuous(mm_data_at, cont_vars, cont_labels,
+                                   "Attempts - continuous moderators (Pearson r)"))
+```
+
+```{r fig-univariate, fig.width = 6.5, fig.height = 5}
+for (outcome in c("Ideation", "Attempt")) {
+  fits <- if (outcome == "Ideation") uni_si else uni_at
+  for (mod in names(fits)) {
+    fo <- fits[[mod]]
+    pl <- if (fo$type == "continuous") plot_bubble_continuous(fo, mod, outcome)
+          else plot_density_categorical(fo, mod, outcome)
+    print(pl$location)
+    if (!is.null(pl$scale)) print(pl$scale)
+  }
+}
+```
+
+```{r fig-profile-likelihood, fig.width = 11, fig.height = 10}
+p_profile_si <- plot_profile_grid(uni_si, "Ideation")
+if (!is.null(p_profile_si)) print(p_profile_si)
+```
+
+```{r fig-multimodel, fig.width = 7, fig.height = 6}
+for (nm in names(mm_list)) {
+  mm   <- mm_list[[nm]]$mm
+  slug <- gsub("[^a-z]+", "_", tolower(nm)) %>% gsub("^_|_$", "", .)
+  print(plot_aicc_profile(mm, paste(nm, "- AICc profile")))
+  grid.arrange(tbl_grob(rank_models_tbl(mm) %>% mutate(moderators = str_trunc(moderators, 55))),
+               top = paste(nm, "- top 10 models"))
+  print(plot_importance(mm$avg, paste(nm, "- importance")))
+  print(plot_coef_forest(mm$avg, paste(nm, "- model-averaged coefficients"), mm_list[[nm]]$comp))
+  write.csv(rank_models_tbl(mm), paste0("top10_models_", slug, ".csv"), row.names = FALSE)
+  write.csv(mm$avg, paste0("coefficients_", slug, ".csv"), row.names = FALSE)
+}
+```
+
+# 8. Main-text figures (JAD artwork specifications)
+
+```{r main-figures, fig.width = 7.5, fig.height = 6}
+# Figures 2 and 3, 190 mm wide (double column), >= 7 pt Arial/Helvetica,
+# no transparency, Okabe-Ito palette. Exported as PDF, EPS and 1000-dpi TIFF.
+
+out_dir <- "figures_main"
+dir.create(out_dir, showWarnings = FALSE)
+
+var_labels <- tribble(
+  ~var,                 ~label,                 ~domain,
+  "lmic",               "Country income level", "Study",
+  "time_weeks_c",       "Follow-up duration",   "Study",
+  "total_n10",          "Sample size",          "Study",
+  "rob_score",          "RoB score",            "Study",
+  "control",            "Control condition",    "Study",
+  "duration_arm1_n",    "Treatment duration",   "Intervention",
+  "direct",             "Directness",           "Intervention",
+  "combi",              "Delivery format",      "Intervention",
+  "family_involvement", "Family involvement",   "Intervention",
+  "age_dich",           "Age group",            "Sample",
+  "disorder_suic",      "Suicide diagnosis",    "Sample",
+  "pct_women_c",        "% Female",             "Sample"
+)
+combi_labels  <- c(single = "Single format", ind_group = "Individual + group",
+                   ind_family = "Individual + family")
+income_labels <- c(hic = "HIC", lmic = "LMIC")
+
+# ── Theme ────────────────────────────────────────────────────────────────────
+pick_font <- function() {
+  if (requireNamespace("systemfonts", quietly = TRUE)) {
+    fams <- unique(systemfonts::system_fonts()$family)
+    for (f in c("Arial", "Helvetica", "Liberation Sans", "Arimo")) if (f %in% fams) return(f)
+  }
+  "sans"
+}
+FONT <- pick_font()
+pt   <- 1 / .pt   # pt -> ggplot linewidth units
+
+theme_jad <- function(base = 7) {
+  theme_classic(base_size = base, base_family = FONT) %+replace%
+    theme(
+      axis.line          = element_line(linewidth = 0.5 * pt, colour = "black"),
+      axis.ticks         = element_line(linewidth = 0.5 * pt, colour = "black"),
+      axis.ticks.length  = unit(1.2, "pt"),
+      axis.text          = element_text(size = base - 0.5, colour = "black"),
+      axis.title         = element_text(size = base),
+      panel.grid.major.x = element_line(linewidth = 0.25 * pt, colour = "grey88"),
+      plot.title         = element_text(size = base, face = "bold", hjust = 0, margin = margin(b = 3)),
+      plot.tag           = element_text(size = base + 1, face = "bold"),
+      legend.text        = element_text(size = base - 0.5),
+      legend.title       = element_text(size = base - 0.5),
+      legend.key.size    = unit(8, "pt"),
+      strip.background   = element_blank(),
+      strip.text         = element_text(size = base, face = "bold", hjust = 0, margin = margin(b = 3)),
+      plot.margin        = margin(4, 6, 4, 4)
+    )
+}
+theme_jad_y <- theme(panel.grid.major.x = element_blank(),
+                     panel.grid.major.y = element_line(linewidth = 0.25 * pt, colour = "grey88"))
+
+OI <- c(blue = "#0072B2", vermillion = "#D55E00", green = "#009E73",
+        orange = "#E69F00", sky = "#56B4E9", grey = "#999999")
+SIZE_RANGE <- c(0.7, 3.2)
+rr_breaks  <- c(0.1, 0.25, 0.5, 1, 2, 4)
+rr_axis    <- sec_axis(~ exp(.), name = "Risk ratio", breaks = rr_breaks,
+                       labels = format(rr_breaks, drop0trailing = TRUE))
+
+# ── Model-implied estimates per factor level (RoB score at its mean) ─────────
+new_row <- function(level, cols, mod, rob_var, rob_mean) {
+  cols <- setdiff(cols, "intrcpt")
+  v <- setNames(numeric(length(cols)), cols)
+  if (paste0(mod, level) %in% cols) v[paste0(mod, level)] <- 1
+  if (rob_var %in% cols) v[rob_var] <- rob_mean
+  v
+}
+
+group_estimates <- function(res) {
+  fit <- res$fit; dat <- res$data; mod <- res$moderator; rv <- res$rob_var
+  lev  <- levels(droplevels(factor(dat[[mod]])))
+  rbar <- mean(dat[[rv]], na.rm = TRUE)
+  Xn  <- do.call(rbind, lapply(lev, new_row, colnames(fit$X), mod, rv, rbar))
+  loc <- pred_fit(fit, newmods = Xn)
+  out <- tibble(level = lev, k = as.integer(table(factor(dat[[mod]], levels = lev))),
+                est = as.numeric(loc$pred), lb = as.numeric(loc$ci.lb), ub = as.numeric(loc$ci.ub))
+  if (!is.null(fit$alpha) && ncol(fit$Z) > 1) {
+    Zn <- do.call(rbind, lapply(lev, new_row, colnames(fit$Z), mod, rv, rbar))
+    sc <- pred_fit(fit, newscale = Zn)
+    out <- out %>% mutate(tau2 = exp(as.numeric(sc$pred)),
+                          tau2_lb = exp(as.numeric(sc$ci.lb)),
+                          tau2_ub = exp(as.numeric(sc$ci.ub)))
+  }
+  out
+}
+
+# Strip plot: observed effects (size = inverse-variance weight, fixed-seed
+# jitter) and model estimate with 95% CI to the right of each group
+plot_group_effects <- function(res, level_labels, fill_cols, y_lab, title) {
+  mod <- res$moderator
+  ge  <- group_estimates(res) %>%
+    mutate(x = row_number(), axis = sprintf("%s\n(k = %d)", level_labels[level], k))
+  set.seed(2026)
+  dat <- res$data %>%
+    mutate(level = as.character(.data[[mod]]),
+           x = match(level, ge$level) - 0.12 + runif(n(), -0.13, 0.13),
+           w = 1 / sei^2) %>%
+    arrange(desc(w))
+  ggplot() +
+    geom_hline(yintercept = 0, linewidth = 0.4 * pt, linetype = "22", colour = "grey40") +
+    geom_point(data = dat, aes(x = x, y = yi, size = w, fill = level),
+               shape = 21, colour = "white", stroke = 0.25) +
+    geom_errorbar(data = ge, aes(x = x + 0.24, ymin = lb, ymax = ub), width = 0, linewidth = 0.75 * pt) +
+    geom_point(data = ge, aes(x = x + 0.24, y = est), shape = 23, size = 2, fill = "black") +
+    scale_fill_manual(values = setNames(fill_cols, ge$level), guide = "none") +
+    scale_size(range = SIZE_RANGE, guide = "none") +
+    scale_x_continuous(breaks = ge$x, labels = ge$axis, expand = expansion(add = 0.45)) +
+    labs(title = title, x = NULL, y = y_lab) +
+    theme_jad() + theme_jad_y + theme(axis.ticks.x = element_blank())
+}
+
+# ── Figure 2 ─────────────────────────────────────────────────────────────────
+stopifnot(!is.null(uni_si$lmic), !is.null(uni_at$total_n10), !is.null(uni_at$combi))
+
+# (A) Ideation by income level: effect size
+lev_inc <- levels(droplevels(factor(uni_si$lmic$data$lmic)))
+lab_inc <- setNames(income_labels[lev_inc], lev_inc)
+col_inc <- ifelse(lab_inc == "LMIC", OI["vermillion"], OI["blue"])
+p2a <- plot_group_effects(uni_si$lmic, lab_inc, col_inc, "Hedges' g", "Suicidal ideation: effect size")
+
+# (B) Ideation by income level: model-estimated tau^2 (dashed = unconditional tau^2)
+ge_inc <- group_estimates(uni_si$lmic) %>%
+  mutate(lab = lab_inc[level], x = row_number(), axis = sprintf("%s\n(k = %d)", lab, k))
+p2b <- ggplot(ge_inc, aes(x = x)) +
+  geom_hline(yintercept = null_si$tau2, linewidth = 0.4 * pt, linetype = "22", colour = "grey40") +
+  geom_errorbar(aes(ymin = tau2_lb, ymax = tau2_ub), width = 0, linewidth = 0.75 * pt) +
+  geom_point(aes(y = tau2, fill = level), shape = 21, size = 2.6, colour = "black", stroke = 0.4) +
+  geom_text(aes(y = tau2, label = sprintf("%.2f", tau2)), nudge_x = 0.2, hjust = 0,
+            size = 6.5 / .pt, family = FONT) +
+  scale_fill_manual(values = setNames(col_inc, ge_inc$level), guide = "none") +
+  scale_x_continuous(breaks = ge_inc$x, labels = ge_inc$axis, expand = expansion(add = 0.6)) +
+  scale_y_log10(breaks = c(0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1, 3, 10),
+                labels = function(b) format(b, drop0trailing = TRUE, scientific = FALSE)) +
+  labs(title = "Suicidal ideation: between-study variance", x = NULL,
+       y = expression("Estimated " * tau^2 * " (log scale)")) +
+  theme_jad() + theme_jad_y + theme(axis.ticks.x = element_blank())
+
+# (C) Attempts by sample size
+fo  <- uni_at$total_n10
+xs  <- seq(min(fo$data$total_n10), max(fo$data$total_n10), length.out = 200)
+nm  <- cbind(total_n10 = xs, rob = mean(fo$data[[fo$rob_var]]))
+colnames(nm)[2] <- fo$rob_var
+prC <- pred_fit(fo$fit, newmods = nm[, setdiff(colnames(fo$fit$X), "intrcpt"), drop = FALSE])
+grid_c <- tibble(N = xs * 10, est = prC$pred, lb = prC$ci.lb, ub = prC$ci.ub)
+dat_c  <- fo$data %>% mutate(N = total_n10 * 10, w = 1 / sei^2) %>% arrange(desc(w))
+
+p2c <- ggplot() +
+  geom_hline(yintercept = 0, linewidth = 0.4 * pt, linetype = "22", colour = "grey40") +
+  geom_ribbon(data = grid_c, aes(x = N, ymin = lb, ymax = ub), fill = "grey85") +
+  geom_point(data = dat_c, aes(x = N, y = yi, size = w), shape = 21,
+             fill = OI["blue"], colour = "white", stroke = 0.25) +
+  geom_line(data = grid_c, aes(x = N, y = est), linewidth = 0.75 * pt) +
+  scale_size(range = SIZE_RANGE, guide = "none") +
+  scale_x_continuous(labels = scales::label_comma(), expand = expansion(mult = 0.02)) +
+  scale_y_continuous(sec.axis = rr_axis) +
+  labs(title = "Suicide attempts: sample size", x = "Total sample size (N)", y = "log risk ratio") +
+  theme_jad() + theme_jad_y
+
+# (D) Attempts by delivery format
+lev_cb <- levels(droplevels(factor(uni_at$combi$data$combi)))
+col_cb <- unname(OI[c("blue", "vermillion", "green")][seq_along(lev_cb)])
+p2d <- plot_group_effects(uni_at$combi, combi_labels, col_cb, "log risk ratio",
+                          "Suicide attempts: delivery format") +
+  scale_y_continuous(sec.axis = rr_axis)
+
+# Common y-range for C and D
+yl_at <- range(c(dat_c$yi, uni_at$combi$data$yi, grid_c$lb, grid_c$ub))
+p2c <- p2c + coord_cartesian(ylim = yl_at)
+p2d <- p2d + coord_cartesian(ylim = yl_at)
+
+fig2 <- (p2a | p2b) / (p2c | p2d) +
+  plot_annotation(tag_levels = "A") &
+  theme(plot.tag.position = c(0, 1),
+        plot.tag = element_text(size = 8, face = "bold", family = FONT, vjust = 1))
+
+# ── Figure 3: importance across specifications ───────────────────────────────
+# One importance value per moderator (all dummy columns of a factor share it)
+param_to_var <- function(param, vars) {
+  vapply(sub("^(loc_|scale_)", "", param), function(t) {
+    hit <- vars[startsWith(t, vars)]
+    if (length(hit)) hit[which.max(nchar(hit))] else NA_character_
+  }, character(1), USE.NAMES = FALSE)
+}
+
+importance_tbl <- function(mm, spec, outcome) {
+  if (is.null(mm)) return(NULL)
+  mm$avg %>%
+    filter(startsWith(parameter, "loc_"), parameter != "loc_intrcpt") %>%
+    mutate(var = param_to_var(parameter, var_labels$var)) %>%
+    filter(!is.na(var)) %>%
+    group_by(var) %>% summarise(importance = max(importance), .groups = "drop") %>%
+    mutate(spec = spec, outcome = outcome)
+}
+
+specs    <- c("Primary analysis", "RoB score forced", "Excl. influential studies", "Excl. outliers")
+outcomes <- c("Suicidal ideation", "Suicide attempts")
+
+imp <- bind_rows(
+  importance_tbl(mm_si,           specs[1], outcomes[1]),
+  importance_tbl(mm_si_forced,    specs[2], outcomes[1]),
+  importance_tbl(mm_si_excl_infl, specs[3], outcomes[1]),
+  importance_tbl(sens_out_si$mm,  specs[4], outcomes[1]),
+  importance_tbl(mm_at,           specs[1], outcomes[2]),
+  importance_tbl(mm_at_forced,    specs[2], outcomes[2]),
+  importance_tbl(mm_at_excl_infl, specs[3], outcomes[2]),
+  importance_tbl(sens_out_at$mm,  specs[4], outcomes[2])
+) %>%
+  filter(!(var == ROB_VAR & spec == specs[2]))   # importance = 1 by construction
+
+shown <- var_labels %>% filter(var %in% full_mods) %>%
+  mutate(domain = factor(domain, levels = c("Study", "Intervention", "Sample")),
+         label  = factor(label, levels = rev(label)))
+
+imp <- imp %>% inner_join(shown, by = "var") %>%
+  mutate(spec = factor(spec, levels = specs), outcome = factor(outcome, levels = outcomes))
+
+# Candidates with no converged model in the primary analysis
+not_est <- expand_grid(var = shown$var, outcome = outcomes) %>%
+  anti_join(imp %>% filter(spec == specs[1]) %>% mutate(outcome = as.character(outcome)),
+            by = c("var", "outcome")) %>%
+  inner_join(shown, by = "var") %>%
+  mutate(outcome = factor(outcome, levels = outcomes))
+
+rng <- imp %>% group_by(outcome, domain, label) %>%
+  summarise(lo = min(importance), hi = max(importance), .groups = "drop")
+
+spec_shape <- setNames(c(21, 24, 22, 23), specs)
+spec_fill  <- setNames(c("black", OI[["sky"]], OI[["orange"]], "white"), specs)
+dodge      <- setNames(c(0.21, 0.07, -0.07, -0.21), specs)
+
+imp     <- imp     %>% mutate(y = as.numeric(label) + dodge[as.character(spec)])
+rng     <- rng     %>% mutate(y = as.numeric(label))
+not_est <- not_est %>% mutate(y = as.numeric(label))
+lab_lookup <- setNames(levels(shown$label), seq_along(levels(shown$label)))
+
+fig3 <- ggplot() +
+  geom_vline(xintercept = 0.8, linewidth = 0.4 * pt, linetype = "22", colour = "grey40") +
+  geom_segment(data = rng, aes(x = lo, xend = hi, y = y, yend = y),
+               linewidth = 2.2, colour = "grey90", lineend = "round") +
+  geom_point(data = imp, aes(x = importance, y = y, shape = spec, fill = spec),
+             size = 1.7, stroke = 0.4, colour = "black") +
+  geom_text(data = not_est, aes(x = 0.5, y = y), label = "Not estimable",
+            size = 6.5 / .pt, family = FONT, fontface = "italic", colour = "grey35") +
+  facet_grid(domain ~ outcome, scales = "free_y", space = "free_y",
+             labeller = labeller(outcome = c("Suicidal ideation" = "A   Suicidal ideation",
+                                             "Suicide attempts"  = "B   Suicide attempts"))) +
+  scale_shape_manual(values = spec_shape, name = NULL, drop = FALSE) +
+  scale_fill_manual(values = spec_fill, name = NULL, drop = FALSE) +
+  scale_x_continuous(limits = c(0, 1), breaks = seq(0, 1, 0.2),
+                     labels = c("0", "0.2", "0.4", "0.6", "0.8", "1"),
+                     expand = expansion(mult = c(0.01, 0.03))) +
+  scale_y_continuous(breaks = function(l) seq(ceiling(l[1]), floor(l[2])),
+                     labels = function(b) lab_lookup[as.character(b)],
+                     expand = expansion(add = 0.45)) +
+  labs(x = "Relative importance (sum of Akaike weights)", y = NULL) +
+  theme_jad() +
+  theme(legend.position = "bottom", legend.margin = margin(0, 0, 0, 0),
+        legend.box.spacing = unit(2, "pt"),
+        panel.spacing.x = unit(10, "pt"), panel.spacing.y = unit(4, "pt"),
+        panel.border = element_rect(fill = NA, linewidth = 0.5 * pt),
+        axis.line = element_blank(),
+        strip.text.y = element_text(angle = 270, hjust = 0.5, face = "bold"),
+        panel.grid.major.x = element_line(linewidth = 0.25 * pt, colour = "grey92")) +
+  guides(shape = guide_legend(nrow = 1), fill = guide_legend(nrow = 1))
+
+# ── Export ───────────────────────────────────────────────────────────────────
+save_jad <- function(plot, name, width_mm = 190, height_mm, dpi = 1000) {
+  w <- width_mm / 25.4; h <- height_mm / 25.4
+  f <- function(ext) file.path(out_dir, paste0(name, ext))
+  ggsave(f(".pdf"), plot, width = w, height = h, device = cairo_pdf)
+  ggsave(f(".eps"), plot, width = w, height = h, device = cairo_ps, fallback_resolution = dpi)
+  tiff_dev <- if (requireNamespace("ragg", quietly = TRUE)) ragg::agg_tiff else "tiff"
+  ggsave(f(".tiff"), plot, width = w, height = h, dpi = dpi, device = tiff_dev, compression = "lzw")
+}
+
+save_jad(fig2, "Figure2", height_mm = 150)
+save_jad(fig3, "Figure3", height_mm = 120)
+
+print(fig2)
+print(fig3)
+
+# ── Numbers behind the figures ───────────────────────────────────────────────
+print(ge_inc %>% select(lab, k, est, lb, ub, tau2, tau2_lb, tau2_ub), width = Inf)
+cat(sprintf("tau2 ratio LMIC/HIC = %.1f\n",
+            ge_inc$tau2[ge_inc$lab == "LMIC"] / ge_inc$tau2[ge_inc$lab == "HIC"]))
+print(group_estimates(uni_at$combi), width = Inf)
+print(imp %>% select(outcome, label, spec, importance) %>%
+        pivot_wider(names_from = spec, values_from = importance) %>%
+        arrange(outcome, desc(label)), n = Inf, width = Inf)
+```
+
+# Session information
+
+```{r session-info, cache = FALSE}
+sessionInfo()
+```
