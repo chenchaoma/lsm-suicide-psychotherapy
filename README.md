@@ -7,7 +7,7 @@ Analysis code for:
 > A Meta-Epidemiological Study of Location and Scale Moderators.* Submitted to the
 > *Journal of Affective Disorders*.
 
-Preregistration: OSF, 10.17605/OSF.IO/XEMVT
+Preregistration: OSF, <https://doi.org/10.17605/OSF.IO/XEMVT>
 
 ## Contents
 
